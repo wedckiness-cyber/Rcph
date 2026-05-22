@@ -1,0 +1,149 @@
+package __PACKAGE__;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.Build;
+import com.getcapacitor.JSArray;
+import com.getcapacitor.JSObject;
+import com.getcapacitor.Plugin;
+import com.getcapacitor.PluginCall;
+import com.getcapacitor.PluginMethod;
+import com.getcapacitor.annotation.CapacitorPlugin;
+import java.util.ArrayList;
+import java.util.List;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+@CapacitorPlugin(name = "BackgroundAudio")
+public class BackgroundAudioPlugin extends Plugin {
+
+    private BroadcastReceiver statusReceiver;
+
+    @Override
+    public void load() {
+        statusReceiver =
+            new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    JSObject payload = new JSObject();
+                    payload.put("status", BackgroundAudioService.getStatus());
+                    notifyListeners("statusChange", payload, true);
+                }
+            };
+
+        IntentFilter filter = new IntentFilter(BackgroundAudioService.ACTION_STATUS_CHANGED);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getContext().registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            getContext().registerReceiver(statusReceiver, filter);
+        }
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        if (statusReceiver != null) {
+            try {
+                getContext().unregisterReceiver(statusReceiver);
+            } catch (IllegalArgumentException ignored) {
+            }
+            statusReceiver = null;
+        }
+    }
+
+    @PluginMethod
+    public void replaceQueue(PluginCall call) {
+        JSArray trackArray = call.getArray("tracks");
+        Integer startIndex = call.getInt("startIndex", 0);
+        String mode = call.getString("mode", "loop");
+        Boolean autoplay = call.getBoolean("autoplay", true);
+
+        if (trackArray == null) {
+            call.reject("tracks is required");
+            return;
+        }
+
+        try {
+            List<BackgroundAudioService.TrackItem> tracks = parseTracks(trackArray);
+            JSObject status = BackgroundAudioService.replaceQueue(
+                getContext(),
+                tracks,
+                startIndex == null ? 0 : startIndex,
+                mode == null ? "loop" : mode,
+                autoplay == null || autoplay
+            );
+            call.resolve(withStatus(status));
+        } catch (JSONException error) {
+            call.reject("Failed to parse tracks", error);
+        }
+    }
+
+    @PluginMethod
+    public void play(PluginCall call) {
+        call.resolve(withStatus(BackgroundAudioService.play(getContext())));
+    }
+
+    @PluginMethod
+    public void pause(PluginCall call) {
+        call.resolve(withStatus(BackgroundAudioService.pause()));
+    }
+
+    @PluginMethod
+    public void stop(PluginCall call) {
+        call.resolve(withStatus(BackgroundAudioService.stop(getContext())));
+    }
+
+    @PluginMethod
+    public void next(PluginCall call) {
+        call.resolve(withStatus(BackgroundAudioService.next(getContext())));
+    }
+
+    @PluginMethod
+    public void previous(PluginCall call) {
+        call.resolve(withStatus(BackgroundAudioService.previous(getContext())));
+    }
+
+    @PluginMethod
+    public void seekTo(PluginCall call) {
+        Double positionSeconds = call.getDouble("positionSeconds", 0d);
+        call.resolve(withStatus(BackgroundAudioService.seekTo(positionSeconds == null ? 0d : positionSeconds)));
+    }
+
+    @PluginMethod
+    public void setPlaybackMode(PluginCall call) {
+        String mode = call.getString("mode", "loop");
+        call.resolve(withStatus(BackgroundAudioService.setPlaybackMode(mode == null ? "loop" : mode)));
+    }
+
+    @PluginMethod
+    public void getStatus(PluginCall call) {
+        call.resolve(withStatus(BackgroundAudioService.getStatus()));
+    }
+
+    private JSObject withStatus(JSObject status) {
+        JSObject result = new JSObject();
+        result.put("status", status);
+        return result;
+    }
+
+    private List<BackgroundAudioService.TrackItem> parseTracks(JSArray trackArray) throws JSONException {
+        List<BackgroundAudioService.TrackItem> tracks = new ArrayList<>();
+
+        for (int i = 0; i < trackArray.length(); i++) {
+            JSONObject track = trackArray.getJSONObject(i);
+            tracks.add(
+                new BackgroundAudioService.TrackItem(
+                    track.optString("id", ""),
+                    track.optString("albumId", ""),
+                    track.optString("title", "Unknown Track"),
+                    track.optString("artist", "Unknown Artist"),
+                    track.optString("cover", ""),
+                    track.optString("url", "")
+                )
+            );
+        }
+
+        return tracks;
+    }
+}

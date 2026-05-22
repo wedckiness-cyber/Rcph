@@ -1,0 +1,922 @@
+package __PACKAGE__;
+
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Context;
+import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.media.AudioAttributes;
+import android.media.MediaPlayer;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.support.v4.media.MediaMetadataCompat;
+import android.support.v4.media.session.MediaSessionCompat;
+import android.support.v4.media.session.PlaybackStateCompat;
+import androidx.annotation.Nullable;
+import androidx.core.app.NotificationCompat;
+import androidx.core.content.ContextCompat;
+import com.getcapacitor.JSObject;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class BackgroundAudioService extends Service {
+
+    private static final String ACTION_PREFIX = "__PACKAGE__.backgroundaudio.";
+
+    public static final String ACTION_STATUS_CHANGED = ACTION_PREFIX + "STATUS_CHANGED";
+
+    private static final String ACTION_SYNC = ACTION_PREFIX + "SYNC";
+    private static final String ACTION_PLAY = ACTION_PREFIX + "PLAY";
+    private static final String ACTION_PAUSE = ACTION_PREFIX + "PAUSE";
+    private static final String ACTION_NEXT = ACTION_PREFIX + "NEXT";
+    private static final String ACTION_PREVIOUS = ACTION_PREFIX + "PREVIOUS";
+    private static final String ACTION_STOP = ACTION_PREFIX + "STOP";
+
+    private static final String CHANNEL_ID = "background_audio_playback";
+    private static final int NOTIFICATION_ID = 41007;
+
+    private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
+    private static final ExecutorService ARTWORK_EXECUTOR = Executors.newSingleThreadExecutor();
+    private static final Random RANDOM = new Random();
+    private static final List<TrackItem> QUEUE = new ArrayList<>();
+
+    private static Context appContext;
+    private static BackgroundAudioService runningService;
+    private static MediaSessionCompat mediaSession;
+    private static MediaPlayer mediaPlayer;
+    private static Bitmap artworkBitmap;
+    private static String artworkSource = "";
+    private static int artworkRequestVersion = 0;
+    private static int currentTrackIndex = -1;
+    private static String playbackMode = "loop";
+    private static boolean prepared = false;
+    private static boolean playWhenReady = false;
+
+    public static final class TrackItem {
+        public final String id;
+        public final String albumId;
+        public final String title;
+        public final String artist;
+        public final String cover;
+        public final String url;
+
+        public TrackItem(
+            String id,
+            String albumId,
+            String title,
+            String artist,
+            String cover,
+            String url
+        ) {
+            this.id = id == null ? "" : id;
+            this.albumId = albumId == null ? "" : albumId;
+            this.title = title == null ? "Unknown Track" : title;
+            this.artist = artist == null ? "Unknown Artist" : artist;
+            this.cover = cover == null ? "" : cover;
+            this.url = url == null ? "" : url;
+        }
+    }
+
+    @Nullable
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        appContext = getApplicationContext();
+        runningService = this;
+        createNotificationChannel();
+        synchronized (BackgroundAudioService.class) {
+            ensureMediaSessionLocked();
+            refreshMediaSessionLocked();
+        }
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        appContext = getApplicationContext();
+        runningService = this;
+
+        final String action = intent != null && intent.getAction() != null ? intent.getAction() : ACTION_SYNC;
+
+        synchronized (BackgroundAudioService.class) {
+            switch (action) {
+                case ACTION_PLAY:
+                    play(appContext);
+                    break;
+                case ACTION_PAUSE:
+                    pause();
+                    break;
+                case ACTION_NEXT:
+                    next(appContext);
+                    break;
+                case ACTION_PREVIOUS:
+                    previous(appContext);
+                    break;
+                case ACTION_STOP:
+                    stop(appContext);
+                    break;
+                case ACTION_SYNC:
+                default:
+                    break;
+            }
+        }
+
+        refreshNotificationAsync();
+        return START_STICKY;
+    }
+
+    @Override
+    public void onDestroy() {
+        synchronized (BackgroundAudioService.class) {
+            runningService = null;
+            releasePlayerLocked();
+            releaseMediaSessionLocked();
+            clearArtworkLocked();
+            QUEUE.clear();
+            currentTrackIndex = -1;
+            prepared = false;
+            playWhenReady = false;
+            notifyStatusChangedLocked();
+        }
+        super.onDestroy();
+    }
+
+    public static synchronized JSObject replaceQueue(
+        Context context,
+        List<TrackItem> tracks,
+        int startIndex,
+        String mode,
+        boolean autoplay
+    ) {
+        appContext = context.getApplicationContext();
+        QUEUE.clear();
+        QUEUE.addAll(tracks);
+        playbackMode = sanitizeMode(mode);
+
+        if (QUEUE.isEmpty()) {
+            stopPlaybackLocked(true);
+            return getStatus();
+        }
+
+        currentTrackIndex = clampIndex(startIndex);
+        playTrackAtIndexLocked(currentTrackIndex, autoplay);
+        return getStatus();
+    }
+
+    public static synchronized JSObject play(Context context) {
+        appContext = context.getApplicationContext();
+
+        if (QUEUE.isEmpty()) {
+            return getStatus();
+        }
+
+        ensureServiceLocked();
+
+        if (mediaPlayer == null) {
+            if (currentTrackIndex < 0) {
+                currentTrackIndex = 0;
+            }
+            playTrackAtIndexLocked(currentTrackIndex, true);
+            return getStatus();
+        }
+
+        playWhenReady = true;
+        if (prepared) {
+            try {
+                mediaPlayer.start();
+            } catch (IllegalStateException ignored) {
+                playTrackAtIndexLocked(currentTrackIndex, true);
+            }
+        }
+
+        notifyStatusChangedLocked();
+        refreshMediaSessionLocked();
+        refreshNotificationLocked();
+        return getStatus();
+    }
+
+    public static synchronized JSObject pause() {
+        playWhenReady = false;
+
+        if (mediaPlayer != null && prepared) {
+            try {
+                if (mediaPlayer.isPlaying()) {
+                    mediaPlayer.pause();
+                }
+            } catch (IllegalStateException ignored) {
+                releasePlayerLocked();
+            }
+        }
+
+        notifyStatusChangedLocked();
+        refreshMediaSessionLocked();
+        refreshNotificationLocked();
+        return getStatus();
+    }
+
+    public static synchronized JSObject stop(Context context) {
+        appContext = context.getApplicationContext();
+        stopPlaybackLocked(true);
+        return getStatus();
+    }
+
+    public static synchronized JSObject next(Context context) {
+        appContext = context.getApplicationContext();
+
+        if (QUEUE.isEmpty()) {
+            return getStatus();
+        }
+
+        ensureServiceLocked();
+        playTrackAtIndexLocked(resolveNextIndexLocked(), true);
+        return getStatus();
+    }
+
+    public static synchronized JSObject previous(Context context) {
+        appContext = context.getApplicationContext();
+
+        if (QUEUE.isEmpty()) {
+            return getStatus();
+        }
+
+        ensureServiceLocked();
+        playTrackAtIndexLocked(resolvePreviousIndexLocked(), true);
+        return getStatus();
+    }
+
+    public static synchronized JSObject seekTo(double positionSeconds) {
+        if (mediaPlayer == null || !prepared) {
+            return getStatus();
+        }
+
+        try {
+            mediaPlayer.seekTo((int) Math.max(positionSeconds * 1000d, 0));
+        } catch (IllegalStateException ignored) {
+            releasePlayerLocked();
+        }
+
+        notifyStatusChangedLocked();
+        refreshMediaSessionLocked();
+        return getStatus();
+    }
+
+    public static synchronized JSObject setPlaybackMode(String mode) {
+        playbackMode = sanitizeMode(mode);
+        notifyStatusChangedLocked();
+        refreshMediaSessionLocked();
+        refreshNotificationLocked();
+        return getStatus();
+    }
+
+    public static synchronized JSObject getStatus() {
+        JSObject status = new JSObject();
+        status.put("available", true);
+        status.put("initialized", mediaPlayer != null || !QUEUE.isEmpty());
+        status.put("isPlaying", isPlayingLocked());
+        status.put("currentTrackIndex", currentTrackIndex);
+        status.put("currentTime", getCurrentTimeSecondsLocked());
+        status.put("duration", getDurationSecondsLocked());
+        status.put("queueSize", QUEUE.size());
+        status.put("mode", playbackMode);
+
+        TrackItem currentTrack = getCurrentTrackLocked();
+        if (currentTrack != null) {
+            status.put("trackId", currentTrack.id);
+            status.put("albumId", currentTrack.albumId);
+            status.put("title", currentTrack.title);
+            status.put("artist", currentTrack.artist);
+        }
+
+        return status;
+    }
+
+    private static synchronized void playTrackAtIndexLocked(int index, boolean autoplay) {
+        if (QUEUE.isEmpty()) {
+            stopPlaybackLocked(true);
+            return;
+        }
+
+        appContext = appContext == null ? runningService : appContext;
+        currentTrackIndex = clampIndex(index);
+        playWhenReady = autoplay;
+        prepared = false;
+        ensureServiceLocked();
+        ensureMediaSessionLocked();
+        releasePlayerLocked();
+
+        TrackItem track = getCurrentTrackLocked();
+        if (track == null || track.url.isEmpty()) {
+            stopPlaybackLocked(false);
+            return;
+        }
+
+        updateArtworkRequestLocked(track);
+
+        mediaPlayer = new MediaPlayer();
+        if (appContext != null) {
+            mediaPlayer.setWakeMode(appContext, PowerManager.PARTIAL_WAKE_LOCK);
+        }
+
+        mediaPlayer.setAudioAttributes(
+            new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+        );
+
+        mediaPlayer.setOnPreparedListener(
+            player -> {
+                synchronized (BackgroundAudioService.class) {
+                    if (mediaPlayer != player) {
+                        return;
+                    }
+
+                    prepared = true;
+                    if (playWhenReady) {
+                        try {
+                            player.start();
+                        } catch (IllegalStateException ignored) {
+                            prepared = false;
+                        }
+                    }
+
+                    notifyStatusChangedLocked();
+                    refreshMediaSessionLocked();
+                    refreshNotificationLocked();
+                }
+            }
+        );
+
+        mediaPlayer.setOnCompletionListener(
+            player -> {
+                synchronized (BackgroundAudioService.class) {
+                    if (QUEUE.isEmpty()) {
+                        stopPlaybackLocked(true);
+                        return;
+                    }
+
+                    if ("one".equals(playbackMode)) {
+                        playTrackAtIndexLocked(currentTrackIndex, true);
+                    } else {
+                        playTrackAtIndexLocked(resolveNextIndexLocked(), true);
+                    }
+                }
+            }
+        );
+
+        mediaPlayer.setOnSeekCompleteListener(
+            player -> {
+                synchronized (BackgroundAudioService.class) {
+                    notifyStatusChangedLocked();
+                    refreshMediaSessionLocked();
+                }
+            }
+        );
+
+        mediaPlayer.setOnErrorListener(
+            (player, what, extra) -> {
+                synchronized (BackgroundAudioService.class) {
+                    prepared = false;
+                    playWhenReady = false;
+                    notifyStatusChangedLocked();
+                    refreshMediaSessionLocked();
+                    refreshNotificationLocked();
+                }
+                return true;
+            }
+        );
+
+        try {
+            mediaPlayer.setDataSource(track.url);
+            mediaPlayer.prepareAsync();
+        } catch (IOException | IllegalArgumentException | IllegalStateException error) {
+            prepared = false;
+            playWhenReady = false;
+            releasePlayerLocked();
+        }
+
+        notifyStatusChangedLocked();
+        refreshMediaSessionLocked();
+        refreshNotificationLocked();
+    }
+
+    private static void stopPlaybackLocked(boolean clearQueue) {
+        playWhenReady = false;
+        prepared = false;
+        releasePlayerLocked();
+
+        if (clearQueue) {
+            QUEUE.clear();
+            currentTrackIndex = -1;
+        }
+
+        clearArtworkLocked();
+
+        notifyStatusChangedLocked();
+        refreshMediaSessionLocked();
+        refreshNotificationLocked();
+    }
+
+    private static void ensureServiceLocked() {
+        if (appContext == null) {
+            return;
+        }
+
+        Intent serviceIntent = new Intent(appContext, BackgroundAudioService.class);
+        serviceIntent.setAction(ACTION_SYNC);
+        ContextCompat.startForegroundService(appContext, serviceIntent);
+    }
+
+    private static void ensureMediaSessionLocked() {
+        if (mediaSession != null || runningService == null) {
+            return;
+        }
+
+        mediaSession = new MediaSessionCompat(runningService, "BackgroundAudioSession");
+        mediaSession.setCallback(
+            new MediaSessionCompat.Callback() {
+                @Override
+                public void onPlay() {
+                    synchronized (BackgroundAudioService.class) {
+                        Context context = appContext != null
+                            ? appContext
+                            : (runningService != null ? runningService.getApplicationContext() : null);
+                        if (context != null) {
+                            BackgroundAudioService.play(context);
+                        }
+                    }
+                }
+
+                @Override
+                public void onPause() {
+                    synchronized (BackgroundAudioService.class) {
+                        BackgroundAudioService.pause();
+                    }
+                }
+
+                @Override
+                public void onSkipToNext() {
+                    synchronized (BackgroundAudioService.class) {
+                        Context context = appContext != null
+                            ? appContext
+                            : (runningService != null ? runningService.getApplicationContext() : null);
+                        if (context != null) {
+                            BackgroundAudioService.next(context);
+                        }
+                    }
+                }
+
+                @Override
+                public void onSkipToPrevious() {
+                    synchronized (BackgroundAudioService.class) {
+                        Context context = appContext != null
+                            ? appContext
+                            : (runningService != null ? runningService.getApplicationContext() : null);
+                        if (context != null) {
+                            BackgroundAudioService.previous(context);
+                        }
+                    }
+                }
+
+                @Override
+                public void onSeekTo(long positionMs) {
+                    synchronized (BackgroundAudioService.class) {
+                        BackgroundAudioService.seekTo(Math.max(positionMs, 0L) / 1000d);
+                    }
+                }
+
+                @Override
+                public void onStop() {
+                    synchronized (BackgroundAudioService.class) {
+                        Context context = appContext != null
+                            ? appContext
+                            : (runningService != null ? runningService.getApplicationContext() : null);
+                        if (context != null) {
+                            BackgroundAudioService.stop(context);
+                        }
+                    }
+                }
+            }
+        );
+        mediaSession.setFlags(
+            MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS |
+            MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS
+        );
+        mediaSession.setActive(true);
+    }
+
+    private static void releaseMediaSessionLocked() {
+        if (mediaSession == null) {
+            return;
+        }
+
+        mediaSession.setActive(false);
+        mediaSession.release();
+        mediaSession = null;
+    }
+
+    private static void releasePlayerLocked() {
+        if (mediaPlayer == null) {
+            return;
+        }
+
+        try {
+            mediaPlayer.reset();
+        } catch (IllegalStateException ignored) {
+        }
+
+        mediaPlayer.release();
+        mediaPlayer = null;
+        prepared = false;
+    }
+
+    private static void notifyStatusChangedLocked() {
+        if (appContext == null) {
+            return;
+        }
+
+        Intent statusIntent = new Intent(ACTION_STATUS_CHANGED);
+        statusIntent.setPackage(appContext.getPackageName());
+        appContext.sendBroadcast(statusIntent);
+    }
+
+    private static void refreshNotificationLocked() {
+        BackgroundAudioService service = runningService;
+        if (service != null) {
+            service.refreshNotificationAsync();
+        }
+    }
+
+    private static void refreshMediaSessionLocked() {
+        ensureMediaSessionLocked();
+        if (mediaSession == null) {
+            return;
+        }
+
+        TrackItem track = getCurrentTrackLocked();
+        final boolean playing = isPlayingLocked();
+        final long positionMs = Math.round(getCurrentTimeSecondsLocked() * 1000d);
+        final long durationMs = Math.round(getDurationSecondsLocked() * 1000d);
+
+        PlaybackStateCompat.Builder playbackState = new PlaybackStateCompat.Builder()
+            .setActions(
+                PlaybackStateCompat.ACTION_PLAY |
+                PlaybackStateCompat.ACTION_PAUSE |
+                PlaybackStateCompat.ACTION_PLAY_PAUSE |
+                PlaybackStateCompat.ACTION_SKIP_TO_NEXT |
+                PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS |
+                PlaybackStateCompat.ACTION_STOP |
+                PlaybackStateCompat.ACTION_SEEK_TO
+            )
+            .setState(
+                resolvePlaybackStateLocked(track, playing),
+                Math.max(positionMs, 0L),
+                playing ? 1f : 0f
+            );
+        mediaSession.setPlaybackState(playbackState.build());
+
+        if (track == null) {
+            mediaSession.setActive(false);
+            return;
+        }
+
+        MediaMetadataCompat.Builder metadata = new MediaMetadataCompat.Builder()
+            .putString(MediaMetadataCompat.METADATA_KEY_TITLE, track.title)
+            .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_TITLE, track.title)
+            .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, track.artist)
+            .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_SUBTITLE, track.artist);
+
+        if (durationMs > 0L) {
+            metadata.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, durationMs);
+        }
+
+        if (artworkBitmap != null) {
+            metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, artworkBitmap);
+            metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, artworkBitmap);
+        }
+
+        mediaSession.setMetadata(metadata.build());
+        mediaSession.setActive(true);
+    }
+
+    private static int resolvePlaybackStateLocked(@Nullable TrackItem track, boolean playing) {
+        if (track == null) {
+            return PlaybackStateCompat.STATE_NONE;
+        }
+
+        if (playing) {
+            return PlaybackStateCompat.STATE_PLAYING;
+        }
+
+        if (playWhenReady && !prepared) {
+            return PlaybackStateCompat.STATE_BUFFERING;
+        }
+
+        return PlaybackStateCompat.STATE_PAUSED;
+    }
+
+    private static void updateArtworkRequestLocked(@Nullable TrackItem track) {
+        final String nextArtworkSource = track != null && track.cover != null ? track.cover.trim() : "";
+        if (nextArtworkSource.equals(artworkSource)) {
+            return;
+        }
+
+        artworkSource = nextArtworkSource;
+        artworkBitmap = null;
+        artworkRequestVersion += 1;
+        final int requestVersion = artworkRequestVersion;
+
+        if (nextArtworkSource.isEmpty() || appContext == null) {
+            return;
+        }
+
+        final Context context = appContext;
+        ARTWORK_EXECUTOR.execute(
+            () -> {
+                Bitmap bitmap = loadArtworkBitmap(context, nextArtworkSource);
+                MAIN_HANDLER.post(
+                    () -> {
+                        synchronized (BackgroundAudioService.class) {
+                            if (
+                                requestVersion != artworkRequestVersion ||
+                                !nextArtworkSource.equals(artworkSource)
+                            ) {
+                                return;
+                            }
+
+                            artworkBitmap = bitmap;
+                            refreshMediaSessionLocked();
+                            refreshNotificationLocked();
+                        }
+                    }
+                );
+            }
+        );
+    }
+
+    private static void clearArtworkLocked() {
+        artworkSource = "";
+        artworkBitmap = null;
+        artworkRequestVersion += 1;
+    }
+
+    @Nullable
+    private static Bitmap loadArtworkBitmap(Context context, String source) {
+        InputStream inputStream = null;
+
+        try {
+            Uri uri = Uri.parse(source);
+            final String scheme = uri.getScheme();
+
+            if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
+                inputStream = new URL(source).openStream();
+            } else if (scheme == null || scheme.isEmpty()) {
+                return BitmapFactory.decodeFile(source);
+            } else {
+                inputStream = context.getContentResolver().openInputStream(uri);
+            }
+
+            if (inputStream == null) {
+                return null;
+            }
+
+            return BitmapFactory.decodeStream(inputStream);
+        } catch (IOException | SecurityException ignored) {
+            return null;
+        } finally {
+            if (inputStream != null) {
+                try {
+                    inputStream.close();
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
+    private void refreshNotificationAsync() {
+        MAIN_HANDLER.post(this::refreshNotificationNow);
+    }
+
+    private void refreshNotificationNow() {
+        synchronized (BackgroundAudioService.class) {
+            if (QUEUE.isEmpty() || currentTrackIndex < 0) {
+                stopForeground(true);
+                stopSelf();
+                return;
+            }
+
+            startForeground(NOTIFICATION_ID, buildNotification());
+        }
+    }
+
+    private android.app.Notification buildNotification() {
+        TrackItem track = getCurrentTrackLocked();
+        final boolean playing = isPlayingLocked();
+        final String title = track != null ? track.title : getString(R.string.app_name);
+        final String artist = track != null ? track.artist : "Background audio";
+
+        Intent launchIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        if (launchIntent == null) {
+            launchIntent = new Intent();
+        }
+
+        PendingIntent contentIntent = PendingIntent.getActivity(
+            this,
+            100,
+            launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(title)
+            .setContentText(artist)
+            .setContentIntent(contentIntent)
+            .setOnlyAlertOnce(true)
+            .setOngoing(playing)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+            .setDeleteIntent(buildServiceActionIntent(ACTION_STOP, 205))
+            .addAction(
+                android.R.drawable.ic_media_previous,
+                "Previous",
+                buildServiceActionIntent(ACTION_PREVIOUS, 201)
+            )
+            .addAction(
+                playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
+                playing ? "Pause" : "Play",
+                buildServiceActionIntent(playing ? ACTION_PAUSE : ACTION_PLAY, 202)
+            )
+            .addAction(
+                android.R.drawable.ic_media_next,
+                "Next",
+                buildServiceActionIntent(ACTION_NEXT, 203)
+            )
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Stop",
+                buildServiceActionIntent(ACTION_STOP, 204)
+            );
+
+        if (artworkBitmap != null) {
+            builder.setLargeIcon(artworkBitmap);
+        }
+
+        if (mediaSession != null) {
+            builder.setStyle(
+                new androidx.media.app.NotificationCompat.MediaStyle()
+                    .setMediaSession(mediaSession.getSessionToken())
+                    .setShowActionsInCompactView(0, 1, 2)
+            );
+        }
+
+        return builder.build();
+    }
+
+    private PendingIntent buildServiceActionIntent(String action, int requestCode) {
+        Intent intent = new Intent(this, BackgroundAudioService.class);
+        intent.setAction(action);
+        return PendingIntent.getService(
+            this,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+    }
+
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return;
+        }
+
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager == null) {
+            return;
+        }
+
+        NotificationChannel channel = new NotificationChannel(
+            CHANNEL_ID,
+            "Background Audio",
+            NotificationManager.IMPORTANCE_LOW
+        );
+        channel.setDescription("Music playback controls");
+        manager.createNotificationChannel(channel);
+    }
+
+    private static boolean isPlayingLocked() {
+        if (mediaPlayer == null || !prepared) {
+            return false;
+        }
+
+        try {
+            return mediaPlayer.isPlaying();
+        } catch (IllegalStateException ignored) {
+            return false;
+        }
+    }
+
+    private static double getCurrentTimeSecondsLocked() {
+        if (mediaPlayer == null || !prepared) {
+            return 0d;
+        }
+
+        try {
+            return mediaPlayer.getCurrentPosition() / 1000d;
+        } catch (IllegalStateException ignored) {
+            return 0d;
+        }
+    }
+
+    private static double getDurationSecondsLocked() {
+        if (mediaPlayer == null || !prepared) {
+            return 0d;
+        }
+
+        try {
+            int durationMs = mediaPlayer.getDuration();
+            return durationMs > 0 ? durationMs / 1000d : 0d;
+        } catch (IllegalStateException ignored) {
+            return 0d;
+        }
+    }
+
+    @Nullable
+    private static TrackItem getCurrentTrackLocked() {
+        if (currentTrackIndex < 0 || currentTrackIndex >= QUEUE.size()) {
+            return null;
+        }
+        return QUEUE.get(currentTrackIndex);
+    }
+
+    private static int resolveNextIndexLocked() {
+        if (QUEUE.isEmpty()) {
+            return -1;
+        }
+
+        if ("random".equals(playbackMode) && QUEUE.size() > 1) {
+            return RANDOM.nextInt(QUEUE.size());
+        }
+
+        if (currentTrackIndex < 0) {
+            return 0;
+        }
+
+        return (currentTrackIndex + 1) % QUEUE.size();
+    }
+
+    private static int resolvePreviousIndexLocked() {
+        if (QUEUE.isEmpty()) {
+            return -1;
+        }
+
+        if ("random".equals(playbackMode) && QUEUE.size() > 1) {
+            return RANDOM.nextInt(QUEUE.size());
+        }
+
+        if (currentTrackIndex < 0) {
+            return 0;
+        }
+
+        return (currentTrackIndex - 1 + QUEUE.size()) % QUEUE.size();
+    }
+
+    private static int clampIndex(int index) {
+        if (QUEUE.isEmpty()) {
+            return -1;
+        }
+
+        if (index < 0) {
+            return 0;
+        }
+
+        if (index >= QUEUE.size()) {
+            return QUEUE.size() - 1;
+        }
+
+        return index;
+    }
+
+    private static String sanitizeMode(String mode) {
+        if ("one".equals(mode) || "random".equals(mode)) {
+            return mode;
+        }
+        return "loop";
+    }
+}
