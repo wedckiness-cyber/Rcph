@@ -1,0 +1,17 @@
+{
+  "appId": "com.roche.app",
+  "appName": "Roche",
+  "webDir": "dist",
+  "plugins": {
+    "PushNotifications": {
+      "presentationOptions": [
+        "sound",
+        "alert"
+      ]
+    },
+    "LocalNotifications": {
+      "smallIcon": "push_icon",
+      "iconColor": "#111111"
+    }
+  }
+}
